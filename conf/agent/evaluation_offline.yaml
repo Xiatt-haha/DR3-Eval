@@ -1,0 +1,40 @@
+# conf/agent/evaluation_offline.yaml
+# Offline mode: No web search, only use RAG (long context) as information source
+# This treats the long context as a simulated "web space"
+#
+# The name of tools and sub-agents defined in: apps/miroflow-agent/src/config/settings.py
+# Each sub-agent prompt is written in: apps/miroflow-agent/src/utils/prompt_utils.py
+defaults:
+  - default
+  - _self_
+
+main_agent:
+  tools:
+    # - tool-rag          # RAG for long context search
+    - tool-python       # Python sandbox for computation
+    - tool-vqa-enhanced # Enhanced vision understanding
+    - tool-vqa          # Basic vision understanding
+    - tool-audio-enhanced # Audio processing
+    - tool-transcribe   # Audio transcription
+    - tool-video-enhanced # Video understanding
+    - tool-reasoning    # Reasoning capabilities
+    # tool-reading removed - main agent should delegate to agent-file-reader for PDF reading
+  max_turns: 10
+
+
+sub_agents:
+  # In offline mode, only agent-rag-search is needed for long context search
+  # agent-browsing has been completely removed from the codebase
+  
+  agent-rag-search:
+    tools:
+      - tool-rag          # RAG for long context search (only tool for this sub-agent)
+    max_turns: 5          # More turns for comprehensive search with different keywords
+  
+  # File reader sub-agent for reading long PDF/Word documents
+  agent-file-reader:
+    tools:
+      - tool-reading      # PDF/document reading tools
+    max_turns: 3          # Usually 3 turns is enough for reading a few files
+
+keep_tool_result: -1

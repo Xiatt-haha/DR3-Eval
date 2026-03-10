@@ -1,0 +1,724 @@
+# Copyright 2025 Miromind.ai
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import asyncio
+import dataclasses
+import logging
+from typing import Any, Dict, List, Tuple, Union
+
+import httpx
+import tiktoken
+from openai import AsyncOpenAI, DefaultAsyncHttpxClient, DefaultHttpxClient, OpenAI
+from openai import APIConnectionError, APITimeoutError as OpenAITimeoutError, RateLimitError
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_not_exception_type
+
+from ...utils.prompt_utils import generate_mcp_system_prompt
+from ..base_client import BaseClient
+from ..exceptions import APIConnectionSkipError, APIRateLimitError, APITimeoutError, extract_trace_id
+
+logger = logging.getLogger("miroflow_agent")
+
+@dataclasses.dataclass
+class OpenAIClient(BaseClient):
+    def _create_client(self) -> Union[AsyncOpenAI, OpenAI]:
+        """Create LLM client with robust timeout and connection settings"""
+        # Configure timeout settings for long-running requests (like summary generation)
+        timeout_config = httpx.Timeout(
+            connect=30.0,
+            read=900.0,
+            write=180.0,
+            pool=120.0,
+        )
+        
+        # Configure connection limits
+        limits = httpx.Limits(
+            max_keepalive_connections=5,
+            max_connections=10,
+            keepalive_expiry=120.0,
+        )
+        
+        if self.async_client:
+            http_client = DefaultAsyncHttpxClient(
+                timeout=timeout_config,
+                limits=limits,
+            )
+            return AsyncOpenAI(
+                api_key=self.api_key,
+                base_url=self.base_url,
+                http_client=http_client,
+                max_retries=3,  # OpenAI client's built-in retry
+                timeout=600.0,  # Overall timeout
+            )
+        else:
+            http_client = DefaultHttpxClient(
+                timeout=timeout_config,
+                limits=limits,
+            )
+            return OpenAI(
+                api_key=self.api_key,
+                base_url=self.base_url,
+                http_client=http_client,
+                max_retries=3,  # OpenAI client's built-in retry
+                timeout=600.0,  # Overall timeout
+            )
+
+    def _recreate_client(self) -> None:
+        """Recreate the client with a fresh connection pool.
+        
+        This is useful when connection errors occur, as the existing
+        connection pool may be in a bad state.
+        """
+        try:
+            # Close existing client if possible
+            if hasattr(self.client, 'close'):
+                if asyncio.iscoroutinefunction(self.client.close):
+                    # For async clients, we can't await here, so just log
+                    self.task_log.log_step(
+                        "info",
+                        "LLM | Client Recreation",
+                        "Async client close skipped (will be garbage collected)",
+                    )
+                else:
+                    self.client.close()
+        except Exception as e:
+            self.task_log.log_step(
+                "warning",
+                "LLM | Client Close Error",
+                f"Error closing old client: {str(e)}",
+            )
+        
+        # Create a new client
+        self.client = self._create_client()
+        self.task_log.log_step(
+            "info",
+            "LLM | Client Recreation",
+            "Successfully recreated LLM client with fresh connection pool",
+        )
+
+    def _update_token_usage(self, usage_data: Any) -> None:
+        """Update cumulative token usage"""
+        if usage_data:
+            input_tokens = getattr(usage_data, "prompt_tokens", 0)
+            output_tokens = getattr(usage_data, "completion_tokens", 0)
+            prompt_tokens_details = getattr(usage_data, "prompt_tokens_details", None)
+            if prompt_tokens_details:
+                cached_tokens = (
+                    getattr(prompt_tokens_details, "cached_tokens", None) or 0
+                )
+            else:
+                cached_tokens = 0
+
+            # Record token usage for the most recent call
+            self.last_call_tokens = {
+                "prompt_tokens": input_tokens,
+                "completion_tokens": output_tokens,
+            }
+
+            # OpenAI does not provide cache_creation_input_tokens
+            self.token_usage["total_input_tokens"] += input_tokens
+            self.token_usage["total_output_tokens"] += output_tokens
+            self.token_usage["total_cache_read_input_tokens"] += cached_tokens
+
+            self.task_log.log_step(
+                "info",
+                "LLM | Token Usage",
+                f"Input: {self.token_usage['total_input_tokens']}, "
+                f"Output: {self.token_usage['total_output_tokens']}",
+            )
+
+    @retry(
+        wait=wait_exponential(multiplier=1, min=2, max=10),  # Fast exponential backoff: 2s, 4s, 8s, 10s...
+        stop=stop_after_attempt(3),  # Only 3 attempts to fail fast
+        retry=retry_if_not_exception_type((APIConnectionSkipError, APIRateLimitError, APITimeoutError))
+    )
+    async def _create_message(
+        self,
+        system_prompt: str,
+        messages_history: List[Dict[str, Any]],
+        tools_definitions,
+        keep_tool_result: int = -1,
+    ):
+        """
+        Send message to OpenAI API.
+        :param system_prompt: System prompt string.
+        :param messages_history: Message history list.
+        :return: OpenAI API response object or None (if error occurs).
+        
+        Note: APIConnectionSkipError is NOT retried - it immediately stops the current task.
+        """
+
+        # put the system prompt in the first message since OpenAI API does not support system prompt in
+        if system_prompt:
+            # Check if there's already a system or developer message
+            if messages_history and messages_history[0]["role"] in [
+                "system",
+                "developer",
+            ]:
+                messages_history[0] = {
+                    "role": "system",
+                    "content": system_prompt,
+                }
+
+            else:
+                messages_history.insert(
+                    0,
+                    {
+                        "role": "system",
+                        "content": system_prompt,
+                    },
+                )
+
+        messages_history = self._remove_tool_result_from_messages(
+            messages_history, keep_tool_result
+        )
+
+        params = {
+            "model": self.model_name,
+            "temperature": self.temperature,
+            "messages": messages_history,
+            "stream": self.stream,
+        }
+        
+        # Only add top_p if it's not None (some models like Claude don't support both temperature and top_p)
+        if self.top_p is not None:
+            params["top_p"] = self.top_p
+        # Check if the model is GPT-5, and adjust the parameter accordingly
+        if "gpt-5" in self.model_name:
+            # Use 'max_completion_tokens' for GPT-5
+            params["max_completion_tokens"] = self.max_tokens
+        else:
+            # Use 'max_tokens' for GPT-4 and other models
+            params["max_tokens"] = self.max_tokens
+        
+        # For Qwen3 models on idealab, we need to explicitly disable thinking mode
+        # when not using streaming, otherwise the API will return an error.
+        # Even with streaming, we disable thinking to get cleaner responses for agent tasks.
+        model_name_lower = self.model_name.lower()
+        if "qwen3" in model_name_lower:
+            params["extra_body"] = {"enable_thinking": False}
+
+        try:
+            if self.stream:
+                # Handle streaming response
+                if self.async_client:
+                    stream_response = await self.client.chat.completions.create(**params)
+                    response = await self._collect_stream_response(stream_response)
+                else:
+                    stream_response = self.client.chat.completions.create(**params)
+                    response = self._collect_stream_response_sync(stream_response)
+            elif self.async_client:
+                response = await self.client.chat.completions.create(**params)
+            else:
+                response = self.client.chat.completions.create(**params)
+            # Update token count
+            self._update_token_usage(getattr(response, "usage", None))
+            self.task_log.log_step(
+                "info",
+                "LLM | Response Status",
+                f"{getattr(response.choices[0], 'finish_reason', 'N/A')}",
+            )
+
+            return response, messages_history
+
+        except asyncio.TimeoutError as e:
+            self.task_log.log_step(
+                "error",
+                "LLM | Timeout Error - SKIPPING TASK",
+                f"Timeout error (will skip this task): {str(e)}",
+            )
+            raise APITimeoutError(
+                "API request timed out - skipping current task",
+                original_error=e
+            )
+        except asyncio.CancelledError as e:
+            self.task_log.log_step(
+                "error",
+                "LLM | Request Cancelled",
+                f"Request was cancelled: {str(e)}",
+            )
+            raise e
+        except RateLimitError as e:
+            self.task_log.log_step(
+                "error",
+                "LLM | Rate Limit Error - SKIPPING TASK",
+                f"Rate limit exceeded (will skip this task): {str(e)}",
+            )
+            raise APIRateLimitError(
+                "API rate limit exceeded - skipping current task",
+                original_error=e
+            )
+        except APIConnectionError as e:
+            self.task_log.log_step(
+                "error",
+                "LLM | Connection Error - SKIPPING TASK",
+                f"API connection error (will skip this task): {str(e)}",
+            )
+            raise APIConnectionSkipError(
+                "API connection error - skipping current task",
+                original_error=e
+            )
+        except OpenAITimeoutError as e:
+            self.task_log.log_step(
+                "error",
+                "LLM | OpenAI Timeout Error - SKIPPING TASK",
+                f"OpenAI timeout error (will skip this task): {str(e)}",
+            )
+            raise APITimeoutError(
+                "OpenAI API timeout - skipping current task",
+                original_error=e
+            )
+        except Exception as e:
+            error_str = str(e).lower()
+            
+            # Check for rate limit / TPM (tokens per minute) exceeded errors
+            rate_limit_keywords = [
+                "rate limit", "rate_limit", "ratelimit",
+                "tokens per minute", "tpm", "rpm",
+                "requests per minute", "quota exceeded",
+                "too many requests", "429"
+            ]
+            is_rate_limit_error = any(keyword in error_str for keyword in rate_limit_keywords)
+            
+            if is_rate_limit_error:
+                self.task_log.log_step(
+                    "error",
+                    "LLM | Rate Limit / TPM Exceeded - SKIPPING TASK",
+                    f"Rate limit or TPM exceeded (will skip this task): {str(e)}",
+                )
+                raise APIRateLimitError(
+                    f"Rate limit / TPM exceeded: {type(e).__name__} - skipping current task",
+                    original_error=e
+                )
+            
+            # Check for connection-related errors in the error message
+            connection_keywords = [
+                "connection", "connect", "timeout", "timed out",
+                "503", "502", "504",
+                "network", "unreachable", "refused", "reset"
+            ]
+            is_connection_error = any(keyword in error_str for keyword in connection_keywords)
+            
+            if is_connection_error:
+                self.task_log.log_step(
+                    "error",
+                    "LLM | Connection Error Detected - SKIPPING TASK",
+                    f"Connection-related error detected (will skip this task): {str(e)}",
+                )
+                raise APIConnectionSkipError(
+                    f"Connection error detected: {type(e).__name__} - skipping current task",
+                    original_error=e
+                )
+            elif "Error code: 400" in str(e) and "longer than the model" in str(e):
+                self.task_log.log_step(
+                    "error",
+                    "LLM | Context Length Error",
+                    f"Error: {str(e)}",
+                )
+                raise e
+            else:
+                self.task_log.log_step(
+                    "error",
+                    "LLM | API Error",
+                    f"Error: {str(e)}",
+                )
+                raise e
+
+    def process_llm_response(
+        self, llm_response: Any, message_history: List[Dict], agent_type: str = "main"
+    ) -> tuple[str, bool, List[Dict]]:
+        """Process LLM response"""
+        if not llm_response or not llm_response.choices:
+            error_msg = "LLM did not return a valid response."
+            self.task_log.log_step(
+                "error", "LLM | Response Error", f"Error: {error_msg}"
+            )
+            return "", True, message_history  # Exit loop, return message_history
+
+        finish_reason = llm_response.choices[0].finish_reason
+        
+        # Normalize finish_reason to lowercase for consistent handling
+        finish_reason_lower = finish_reason.lower() if finish_reason else ""
+        
+        # Extract LLM response text
+        if finish_reason_lower == "stop":
+            assistant_response_text = llm_response.choices[0].message.content or ""
+
+            message_history.append(
+                {"role": "assistant", "content": assistant_response_text}
+            )
+
+        elif finish_reason_lower == "length":
+            assistant_response_text = llm_response.choices[0].message.content or ""
+            if assistant_response_text == "":
+                assistant_response_text = "LLM response is empty."
+            elif "Context length exceeded" in assistant_response_text:
+                # This is the case where context length is exceeded, needs special handling
+                self.task_log.log_step(
+                    "warning",
+                    "LLM | Context Length",
+                    "Detected context length exceeded, returning error status",
+                )
+                message_history.append(
+                    {"role": "assistant", "content": assistant_response_text}
+                )
+                return (
+                    assistant_response_text,
+                    True,
+                    message_history,
+                )  # Return True to indicate need to exit loop
+
+            # Add assistant response to history
+            message_history.append(
+                {"role": "assistant", "content": assistant_response_text}
+            )
+
+        elif finish_reason_lower in ["error_finish", "error", "content_filter"]:
+            # Handle API error responses - raise a retryable error
+            error_msg = f"LLM API returned error finish reason: {finish_reason}"
+            self.task_log.log_step(
+                "warning",
+                "LLM | API Error Finish",
+                error_msg,
+            )
+            # Raise a specific error that can be caught and retried
+            raise RuntimeError(f"Retryable LLM error: {error_msg}")
+
+        else:
+            raise ValueError(
+                f"Unsupported finish reason: {finish_reason}"
+            )
+
+        return assistant_response_text, False, message_history
+
+    def extract_tool_calls_info(
+        self, llm_response: Any, assistant_response_text: str
+    ) -> List[Dict]:
+        """Extract tool call information from LLM response"""
+        from ...utils.parsing_utils import parse_llm_response_for_tool_calls
+
+        return parse_llm_response_for_tool_calls(assistant_response_text)
+
+    def update_message_history(
+        self, message_history: List[Dict], all_tool_results_content_with_id: List[Tuple]
+    ) -> List[Dict]:
+        """Update message history with tool calls data (llm client specific)"""
+
+        merged_text = "\n".join(
+            [
+                item[1]["text"]
+                for item in all_tool_results_content_with_id
+                if item[1]["type"] == "text"
+            ]
+        )
+
+        message_history.append(
+            {
+                "role": "user",
+                "content": merged_text,
+            }
+        )
+
+        return message_history
+
+    def generate_agent_system_prompt(self, date: Any, mcp_servers: List[Dict]) -> str:
+        return generate_mcp_system_prompt(date, mcp_servers)
+
+    def _estimate_tokens(self, text: str) -> int:
+        """Use tiktoken to estimate the number of tokens in text"""
+        if not hasattr(self, "encoding"):
+            # Initialize tiktoken encoder
+            try:
+                self.encoding = tiktoken.get_encoding("o200k_base")
+            except Exception:
+                # If o200k_base is not available, use cl100k_base as fallback
+                self.encoding = tiktoken.get_encoding("cl100k_base")
+
+        try:
+            # Use disallowed_special=() to allow all special tokens to be encoded as normal text
+            # This prevents errors when encountering tokens like <|endofprompt|>
+            return len(self.encoding.encode(text, disallowed_special=()))
+        except Exception as e:
+            # If encoding fails, use simple estimation: approximately 1 token per 4 characters
+            self.task_log.log_step(
+                "error",
+                "LLM | Token Estimation Error",
+                f"Error: {str(e)}",
+            )
+            return len(text) // 4
+
+    def ensure_summary_context(
+        self, message_history: list, summary_prompt: str
+    ) -> tuple[bool, list]:
+        """
+        Check if current message_history + summary_prompt will exceed context
+        If it will exceed, remove the last assistant-user pair and return False
+        Return True to continue, False if messages have been rolled back
+        """
+        # Get token usage from the last LLM call
+        last_prompt_tokens = self.last_call_tokens.get("prompt_tokens", 0)
+        last_completion_tokens = self.last_call_tokens.get("completion_tokens", 0)
+        buffer_factor = 2
+
+        # Calculate token count for summary prompt
+        summary_tokens = self._estimate_tokens(summary_prompt) * buffer_factor
+
+        # Calculate token count for the last user message in message_history (if exists and not sent)
+        last_user_tokens = 0
+        if message_history[-1]["role"] == "user":
+            content = message_history[-1]["content"]
+            last_user_tokens = self._estimate_tokens(content) * buffer_factor
+
+        # Calculate total token count: last prompt + completion + last user message + summary + reserved response space
+        estimated_total = (
+            last_prompt_tokens
+            + last_completion_tokens
+            + last_user_tokens
+            + summary_tokens
+            + self.max_tokens
+            + 1000  # Add 1000 tokens as buffer
+        )
+
+        if estimated_total >= self.max_context_length:
+            self.task_log.log_step(
+                "info",
+                "LLM | Context Limit Reached",
+                "Context limit reached, proceeding to step back and summarize the conversation",
+            )
+
+            # Remove the last user message (tool call results)
+            if message_history[-1]["role"] == "user":
+                message_history.pop()
+
+            # Remove the second-to-last assistant message (tool call request)
+            if message_history[-1]["role"] == "assistant":
+                message_history.pop()
+
+            self.task_log.log_step(
+                "info",
+                "LLM | Context Limit Reached",
+                f"Removed the last assistant-user pair, current message_history length: {len(message_history)}",
+            )
+
+            return False, message_history
+
+        self.task_log.log_step(
+            "info",
+            "LLM | Context Limit Not Reached",
+            f"{estimated_total}/{self.max_context_length}",
+        )
+        return True, message_history
+
+    def handle_max_turns_reached_summary_prompt(
+        self, message_history: List[Dict], summary_prompt: str
+    ) -> str:
+        """Handle max turns reached summary prompt"""
+        if message_history[-1]["role"] == "user":
+            message_history.pop()  # Remove the last user message
+            # TODO: this part is a temporary fix, we need to find a better way to handle this
+            return summary_prompt
+        else:
+            return summary_prompt
+
+    def format_token_usage_summary(self) -> tuple[List[str], str]:
+        """Format token usage statistics, return summary_lines for format_final_summary and log string"""
+        token_usage = self.get_token_usage()
+
+        total_input = token_usage.get("total_input_tokens", 0)
+        total_output = token_usage.get("total_output_tokens", 0)
+        cache_input = token_usage.get("total_cache_input_tokens", 0)
+
+        summary_lines = []
+        summary_lines.append("\n" + "-" * 20 + " Token Usage " + "-" * 20)
+        summary_lines.append(f"Total Input Tokens: {total_input}")
+        summary_lines.append(f"Total Cache Input Tokens: {cache_input}")
+        summary_lines.append(f"Total Output Tokens: {total_output}")
+        summary_lines.append("-" * (40 + len(" Token Usage ")))
+        summary_lines.append("Pricing is disabled - no cost information available")
+        summary_lines.append("-" * (40 + len(" Token Usage ")))
+
+        # Generate log string
+        log_string = (
+            f"[{self.model_name}] Total Input: {total_input}, "
+            f"Cache Input: {cache_input}, "
+            f"Output: {total_output}"
+        )
+
+        return summary_lines, log_string
+
+    def get_token_usage(self):
+        return self.token_usage.copy()
+
+    async def _collect_stream_response(self, stream_response):
+        """Collect streaming response chunks into a complete response object (async version)"""
+        full_content = ""
+        reasoning_content = ""
+        finish_reason = None
+        usage_data = None
+        chunk_count = 0
+        empty_choices_count = 0
+        
+        async for chunk in stream_response:
+            chunk_count += 1
+            
+            # Track chunks with empty choices
+            if not chunk.choices or len(chunk.choices) == 0:
+                empty_choices_count += 1
+            
+            if chunk.choices and len(chunk.choices) > 0:
+                delta = chunk.choices[0].delta
+                if delta:
+                    # Handle regular content
+                    if delta.content:
+                        full_content += delta.content
+                    # Handle Qwen3 reasoning_content (thinking mode)
+                    if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+                        reasoning_content += delta.reasoning_content
+                if chunk.choices[0].finish_reason:
+                    finish_reason = chunk.choices[0].finish_reason
+            # Some APIs return usage in the last chunk
+            if hasattr(chunk, 'usage') and chunk.usage:
+                usage_data = chunk.usage
+        
+        # Log stream statistics for debugging
+        self.task_log.log_step(
+            "info",
+            "LLM | Stream Stats",
+            f"Total chunks: {chunk_count}, Empty choices: {empty_choices_count}, "
+            f"Content length: {len(full_content)}, Reasoning length: {len(reasoning_content)}",
+        )
+        
+        # If content is empty but we have reasoning_content, use reasoning_content
+        # This handles the case where Qwen3 returns thinking content even with enable_thinking=False
+        if not full_content.strip() and reasoning_content.strip():
+            self.task_log.log_step(
+                "warning",
+                "LLM | Stream Response",
+                f"Content is empty, using reasoning_content instead (length: {len(reasoning_content)})",
+            )
+            full_content = reasoning_content
+        
+        # Warn if both content and reasoning_content are empty
+        if not full_content.strip() and not reasoning_content.strip():
+            self.task_log.log_step(
+                "warning",
+                "LLM | Stream Response Empty",
+                f"Both content and reasoning_content are empty! "
+                f"Chunks: {chunk_count}, Empty choices: {empty_choices_count}, "
+                f"Usage: {usage_data}",
+            )
+        
+        # Create a mock response object that matches the non-streaming format
+        class MockMessage:
+            def __init__(self, content):
+                self.content = content
+                self.role = "assistant"
+                self.tool_calls = None
+        
+        class MockChoice:
+            def __init__(self, message, finish_reason):
+                self.message = message
+                self.finish_reason = finish_reason or "stop"
+        
+        class MockResponse:
+            def __init__(self, choices, usage):
+                self.choices = choices
+                self.usage = usage
+        
+        mock_message = MockMessage(full_content)
+        mock_choice = MockChoice(mock_message, finish_reason)
+        mock_response = MockResponse([mock_choice], usage_data)
+        
+        return mock_response
+
+    def _collect_stream_response_sync(self, stream_response):
+        """Collect streaming response chunks into a complete response object (sync version)"""
+        full_content = ""
+        reasoning_content = ""
+        finish_reason = None
+        usage_data = None
+        chunk_count = 0
+        empty_choices_count = 0
+        
+        for chunk in stream_response:
+            chunk_count += 1
+            
+            # Track chunks with empty choices
+            if not chunk.choices or len(chunk.choices) == 0:
+                empty_choices_count += 1
+            
+            if chunk.choices and len(chunk.choices) > 0:
+                delta = chunk.choices[0].delta
+                if delta:
+                    # Handle regular content
+                    if delta.content:
+                        full_content += delta.content
+                    # Handle Qwen3 reasoning_content (thinking mode)
+                    if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+                        reasoning_content += delta.reasoning_content
+                if chunk.choices[0].finish_reason:
+                    finish_reason = chunk.choices[0].finish_reason
+            # Some APIs return usage in the last chunk
+            if hasattr(chunk, 'usage') and chunk.usage:
+                usage_data = chunk.usage
+        
+        # Log stream statistics for debugging
+        self.task_log.log_step(
+            "info",
+            "LLM | Stream Stats (sync)",
+            f"Total chunks: {chunk_count}, Empty choices: {empty_choices_count}, "
+            f"Content length: {len(full_content)}, Reasoning length: {len(reasoning_content)}",
+        )
+        
+        # If content is empty but we have reasoning_content, use reasoning_content
+        # This handles the case where Qwen3 returns thinking content even with enable_thinking=False
+        if not full_content.strip() and reasoning_content.strip():
+            self.task_log.log_step(
+                "warning",
+                "LLM | Stream Response",
+                f"Content is empty, using reasoning_content instead (length: {len(reasoning_content)})",
+            )
+            full_content = reasoning_content
+        
+        # Warn if both content and reasoning_content are empty
+        if not full_content.strip() and not reasoning_content.strip():
+            self.task_log.log_step(
+                "warning",
+                "LLM | Stream Response Empty (sync)",
+                f"Both content and reasoning_content are empty! "
+                f"Chunks: {chunk_count}, Empty choices: {empty_choices_count}, "
+                f"Usage: {usage_data}",
+            )
+        
+        # Create a mock response object that matches the non-streaming format
+        class MockMessage:
+            def __init__(self, content):
+                self.content = content
+                self.role = "assistant"
+                self.tool_calls = None
+        
+        class MockChoice:
+            def __init__(self, message, finish_reason):
+                self.message = message
+                self.finish_reason = finish_reason or "stop"
+        
+        class MockResponse:
+            def __init__(self, choices, usage):
+                self.choices = choices
+                self.usage = usage
+        
+        mock_message = MockMessage(full_content)
+        mock_choice = MockChoice(mock_message, finish_reason)
+        mock_response = MockResponse([mock_choice], usage_data)
+        
+        return mock_response

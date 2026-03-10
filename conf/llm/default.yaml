@@ -1,0 +1,28 @@
+# conf/llm/default.yaml - Default LLM configuration
+
+# NOTE: Sensitive information (api_key, base_url) should be set in .env file
+# The system will automatically read from environment variables:
+#   - OPENAI_API_KEY / OPENAI_BASE_URL (for openai/qwen provider)
+#   - ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL (for anthropic provider)
+#
+# You can still override these values here if needed, but it's NOT recommended
+# as it may lead to accidental exposure when pushing code to git.
+
+provider: "openai" # openai, anthropic, qwen
+model_name: "qwen2.5-coder-32b-instruct" # gpt-4.1 claude35_sonnet qwen2.5-7b-instruct
+async_client: false
+temperature: 0.3
+top_p: 1.0
+min_p: 0.0
+top_k: -1
+max_tokens: 16382
+max_context_length: 128000
+keep_tool_result: -1
+# 启用流式响应，避免长时间请求导致连接被关闭
+# 对于长上下文的请求，非流式模式可能需要等待几分钟
+# 在此期间连接上没有数据流动，可能被代理/防火墙误判为死连接
+stream: true
+
+# API credentials - leave empty/null to use environment variables (recommended)
+api_key: null
+base_url: null
