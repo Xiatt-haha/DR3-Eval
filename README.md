@@ -7,6 +7,9 @@
   <a href="https://huggingface.co/datasets/NJU-LINK/DR3-Eval">
     <img src="https://img.shields.io/badge/🤗%20HuggingFace-Dataset-yellow.svg" alt="HuggingFace Dataset">
   </a>
+  <a href="https://nju-link.github.io/DR3-Eval/">
+    <img src="https://img.shields.io/badge/🌐%20Homepage-Project%20Page-blue.svg" alt="Project Homepage">
+  </a>
   <a href="LICENSE">
     <img src="https://img.shields.io/badge/License-Apache%202.0-green.svg" alt="License">
   </a>
